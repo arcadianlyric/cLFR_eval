@@ -9,6 +9,43 @@ Within GIAB confident regions, label each site as:
 Only SNVs are used. GIAB indel/other positions are excluded from the error class
 (ambiguous). Output feeds 02_extract_features.py.
 
+Inputs
+------
+  --bam            aligned reads. Default input = SE600 (single-end ~600bp,
+                   minimap2). Needs .bai. UMI/barcode may be in read name or BX tag
+                   (used later by 02, not here).
+  --ref            reference FASTA, needs .fai (samtools faidx).
+  --truth-vcf      GIAB SNV truth VCF, bgzip + tabix (.tbi). e.g. HG002
+                   HG002_GRCh38_1_22_..._benchmark.vcf.gz
+  --confident-bed  GIAB high-confidence regions BED (0-based half-open). Labels are
+                   only made inside these regions (outside, hom-ref is not trusted).
+  --regions        one or more chroms/regions to scan, e.g. `chr1` or
+                   `chr20:1-1000000`. Train on one chrom, hold out another for test.
+  --out            output candidates TSV.
+  --min-alt-reads  (default 2) min alt reads for an error-class candidate.
+  --min-base-quality (default 0) SE600 keeps low-qual bases; leave 0.
+  --max-depth      (default 8000) pileup depth cap.
+
+Output TSV columns: chrom  pos  ref  alt  label  dp  alt_reads  vaf
+(label: 1=true GIAB SNV, 0=error at confident hom-ref)
+
+Usage
+-----
+  # train chrom (chr1) + held-out test chrom (chr20), HG002 SE600
+  python 01_make_candidates.py \
+    --bam   HG002.se600.minimap2.bam \
+    --ref   GRCh38.fa \
+    --truth-vcf HG002_GIAB_SNV.vcf.gz \
+    --confident-bed HG002_confident.bed \
+    --regions chr1 chr20 \
+    --out   out/candidates.tsv \
+    --min-alt-reads 2
+
+  # single small region for a quick smoke test
+  python 01_make_candidates.py --bam a.bam --ref ref.fa \
+    --truth-vcf t.vcf.gz --confident-bed c.bed \
+    --regions chr20:1-2000000 --out out/candidates.smoke.tsv
+
 Requires: pysam. Truth VCF must be bgzip+tabix; confident BED is 0-based half-open.
 """
 import argparse
