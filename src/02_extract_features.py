@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""Step 2 (Claim A): molecule-linkage features per candidate site.
+
+Reads are grouped by UMI/barcode (molecule) so we can measure whether alt support
+is consistent WITHIN independent molecules (true variant) or scattered across
+single reads (sequencing error), plus mapping-error indicators.
+
+Default input = SE600 (single-end ~600bp, mapped with minimap2). minimap2 CIGAR is
+messy near indels/homopolymers/junctions, so we add CIGAR-robustness features that
+let the model distrust alignment-artifact positions:
+  * alt_indel_near_frac  fraction of alt reads with an I/D within --indel-window bp
+                         (N/intron does NOT count -> splice-aware)
+  * alt_nm_mean          mean edit distance (NM tag) of alt reads (noisy alignment)
+  * homopolymer_run      reference homopolymer run length at the site
+Note: for SE600 we keep low-MAPQ reads (min-base-quality/MAPQ not used as a hard
+filter); MAPQ enters only as a feature. For RNA, map with `minimap2 -x splice`.
+
+Molecule id source:
+  --molecule-source tag            -> read tag (default BX)
+  --molecule-source readname_regex -> group(1) of a regex on the read name
+  --molecule-source read           -> each read is its own molecule (ablation)
+"""
+import argparse
+import re
+import sys
+
+import numpy as np
+import pysam
+
+FEATURES = [
+    "dp", "alt_reads", "ref_reads", "vaf",
+    "n_mol_total", "n_mol_alt", "n_mol_ref", "mol_alt_fraction",
+    "alt_reads_per_alt_mol_mean", "within_mol_alt_agreement_mean",
+    "alt_bq_mean", "alt_bq_min", "ref_bq_mean",
+    "alt_mapq_mean", "alt_mapq_min", "ref_mapq_mean",
+    "alt_strand_balance", "alt_softclip_frac_mean",
+    "alt_readpos_fromend_mean", "alt_readpos_fromend_min",
+    "alt_indel_near_frac", "alt_nm_mean", "homopolymer_run",
+    "alt_clip_frac_mean", "alt_supplementary_frac",
+]
+
+
+def molecule_id(aln, source, tag, regex):
+    if source == "tag":
+        try:
+            return str(aln.get_tag(tag))
+        except KeyError:
+            return None
+    if source == "readname_regex":
+        m = regex.search(aln.query_name)
+        return m.group(1) if m else None
+    return aln.query_name
+
+
+def softclip_frac(aln):
+    if aln.cigartuples is None:
+        return 0.0
+    sc = sum(l for op, l in aln.cigartuples if op == 4)
+    return sc / (aln.query_length or 1)
+
+
+def clip_frac(aln):
+    """Total clip (soft S + hard H) over full read length. Unlike softclip_frac,
+    this catches hard-clipped supplementary/chimeric reads (H is not in the query
+    sequence, so query_length misses it)."""
+    if aln.cigartuples is None:
+        return 0.0
+    clip = sum(l for op, l in aln.cigartuples if op in (4, 5))  # S + H
+    return clip / (aln.infer_read_length() or 1)
+
+
+def is_split(aln):
+    """Chimeric / split alignment: supplementary or secondary flag, or has SA tag."""
+    return aln.is_supplementary or aln.is_secondary or aln.has_tag("SA")
+
+
+def indel_near(aln, pos0, window):
+    """True if the read has an insertion/deletion within `window` ref bp of pos0.
+    N (op 3, intron/refskip) is NOT an indel -> spliced alignments are not
+    penalized (important for RNA SE600)."""
+    if aln.cigartuples is None:
+        return False
+    ref = aln.reference_start
+    for op, length in aln.cigartuples:
+        if op in (0, 7, 8):        # M/=/X consume ref
+            ref += length
+        elif op == 2:              # D deletion = indel
+            if abs(ref - pos0) <= window:
+                return True
+            ref += length
+        elif op == 3:              # N intron/refskip = splice, not indel
+            ref += length
+        elif op == 1:              # I insertion = indel, at current ref
+            if abs(ref - pos0) <= window:
+                return True
+        # S/H/P consume no ref
+    return False
+
+
+def homopolymer_run(fasta, chrom, pos0, flank=20):
+    lo = max(0, pos0 - flank)
+    seq = fasta.fetch(chrom, lo, pos0 + flank + 1).upper()
+    i = pos0 - lo
+    if i < 0 or i >= len(seq) or seq[i] not in "ACGT":
+        return 0
+    base = seq[i]
+    l = r = i
+    while l - 1 >= 0 and seq[l - 1] == base:
+        l -= 1
+    while r + 1 < len(seq) and seq[r + 1] == base:
+        r += 1
+    return r - l + 1
+
+
+def mean_min(vals):
+    if not vals:
+        return np.nan, np.nan
+    a = np.asarray(vals, dtype=float)
+    return float(a.mean()), float(a.min())
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--bam", required=True)
+    ap.add_argument("--ref", required=True, help="reference FASTA (+ .fai) for homopolymer context")
+    ap.add_argument("--candidates", required=True, help="TSV from 01_make_candidates.py")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--molecule-source", choices=["tag", "readname_regex", "read"],
+                    default="tag")
+    ap.add_argument("--molecule-tag", default="BX")
+    ap.add_argument("--readname-regex", default=r"#([ACGTN]+)",
+                    help="regex, group(1)=barcode (for --molecule-source readname_regex)")
+    ap.add_argument("--indel-window", type=int, default=10,
+                    help="an alt read counts as indel-adjacent if it has an I/D within this many ref bp")
+    ap.add_argument("--min-base-quality", type=int, default=0)
+    ap.add_argument("--max-depth", type=int, default=8000)
+    args = ap.parse_args()
+
+    regex = re.compile(args.readname_regex)
+    bam = pysam.AlignmentFile(args.bam, "rb")
+    fasta = pysam.FastaFile(args.ref)
+
+    with open(args.candidates) as fh, open(args.out, "w") as out:
+        header = fh.readline().rstrip("\n").split("\t")
+        idx = {c: i for i, c in enumerate(header)}
+        out.write("\t".join(["chrom", "pos", "ref", "alt", "label"] + FEATURES) + "\n")
+
+        for line in fh:
+            f = line.rstrip("\n").split("\t")
+            chrom, pos1 = f[idx["chrom"]], int(f[idx["pos"]])
+            ref, alt, label = f[idx["ref"]], f[idx["alt"]], f[idx["label"]]
+            pos0 = pos1 - 1
+
+            alt_bq, ref_bq, alt_mapq, ref_mapq = [], [], [], []
+            alt_sc, alt_readpos, alt_indel, alt_nm = [], [], [], []
+            alt_clip, alt_supp = [], []
+            alt_fwd = alt_rev = 0
+            mol = {}  # mol_id -> [n_reads, n_alt]
+
+            for col in bam.pileup(chrom, pos0, pos0 + 1, truncate=True,
+                                  min_base_quality=args.min_base_quality,
+                                  stepper="samtools", max_depth=args.max_depth):
+                if col.reference_pos != pos0:
+                    continue
+                for pr in col.pileups:
+                    if pr.is_del or pr.is_refskip or pr.query_position is None:
+                        continue
+                    aln = pr.alignment
+                    qpos = pr.query_position
+                    base = aln.query_sequence[qpos].upper()
+                    if base not in "ACGT":
+                        continue
+                    bq = aln.query_qualities[qpos] if aln.query_qualities is not None else 0
+                    mid = molecule_id(aln, args.molecule_source, args.molecule_tag, regex) \
+                        or aln.query_name
+                    rec = mol.setdefault(mid, [0, 0])
+                    rec[0] += 1
+                    if base == alt:
+                        rec[1] += 1
+                        alt_bq.append(bq)
+                        alt_mapq.append(aln.mapping_quality)
+                        alt_sc.append(softclip_frac(aln))
+                        ql = aln.query_length or (qpos + 1)
+                        alt_readpos.append(min(qpos, ql - 1 - qpos))
+                        alt_indel.append(1.0 if indel_near(aln, pos0, args.indel_window) else 0.0)
+                        alt_nm.append(float(aln.get_tag("NM")) if aln.has_tag("NM") else np.nan)
+                        alt_clip.append(clip_frac(aln))
+                        alt_supp.append(1.0 if is_split(aln) else 0.0)
+                        if aln.is_reverse:
+                            alt_rev += 1
+                        else:
+                            alt_fwd += 1
+                    elif base == ref:
+                        ref_bq.append(bq)
+                        ref_mapq.append(aln.mapping_quality)
+
+            dp = sum(v[0] for v in mol.values())
+            alt_reads = sum(v[1] for v in mol.values())
+            ref_reads = len(ref_bq)
+            n_mol_total = len(mol)
+            n_mol_alt = sum(1 for v in mol.values() if v[1] > 0)
+            n_mol_ref = n_mol_total - n_mol_alt
+            vaf = alt_reads / dp if dp else np.nan
+            mol_alt_fraction = n_mol_alt / n_mol_total if n_mol_total else np.nan
+            per_alt_mol = [v[1] for v in mol.values() if v[1] > 0]
+            within = [v[1] / v[0] for v in mol.values() if v[1] > 0]
+
+            abq_m, abq_min = mean_min(alt_bq)
+            rbq_m, _ = mean_min(ref_bq)
+            amq_m, amq_min = mean_min(alt_mapq)
+            rmq_m, _ = mean_min(ref_mapq)
+            sc_m, _ = mean_min(alt_sc)
+            rp_m, rp_min = mean_min(alt_readpos)
+            strand_balance = (min(alt_fwd, alt_rev) / (alt_fwd + alt_rev)
+                              if (alt_fwd + alt_rev) else np.nan)
+            indel_frac = float(np.mean(alt_indel)) if alt_indel else np.nan
+            nm_mean = (float(np.nanmean(alt_nm))
+                       if alt_nm and not np.all(np.isnan(alt_nm)) else np.nan)
+            hp = homopolymer_run(fasta, chrom, pos0)
+            clip_m, _ = mean_min(alt_clip)
+            supp_frac = float(np.mean(alt_supp)) if alt_supp else np.nan
+
+            vals = [dp, alt_reads, ref_reads, vaf,
+                    n_mol_total, n_mol_alt, n_mol_ref, mol_alt_fraction,
+                    float(np.mean(per_alt_mol)) if per_alt_mol else np.nan,
+                    float(np.mean(within)) if within else np.nan,
+                    abq_m, abq_min, rbq_m, amq_m, amq_min, rmq_m,
+                    strand_balance, sc_m, rp_m, rp_min,
+                    indel_frac, nm_mean, hp, clip_m, supp_frac]
+            out.write("\t".join([chrom, str(pos1), ref, alt, label]
+                                 + [f"{v:.4f}" if isinstance(v, float) else str(v)
+                                    for v in vals]) + "\n")
+
+    sys.stderr.write(f"[extract_features] -> {args.out}\n")
+
+
+if __name__ == "__main__":
+    main()
