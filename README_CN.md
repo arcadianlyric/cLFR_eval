@@ -111,4 +111,27 @@ bcftools consensus -f REF.fa out/corrected.pass.vcf.gz > corrected_isoforms.fa
 ## 依赖
 
 `pysam, pandas, numpy, scikit-learn, lightgbm`（见 `environment.yml`）；
-`bcftools`（校正 FASTA 用）。真值 VCF 需 bgzip+tabix；参考需 `.fai`。
+`samtools, htslib, bcftools`（建索引 + 第 4 步 consensus）。
+
+## 前置：索引（先做这个）
+
+| 输入 | 需要 | 命令 |
+|---|---|---|
+| BAM | `.bai` | `samtools index reads.bam` |
+| 参考 FASTA | `.fai` | `samtools faidx ref.fa` |
+| 真值 VCF | bgzip **+** tabix `.tbi` | `bgzip -c t.vcf > t.vcf.gz && tabix -p vcf t.vcf.gz` |
+| confident BED | 无（整读进内存） | 不用 |
+
+普通 `.vcf` 或普通 gzip 压的 `.vcf.gz` 会触发 `fetch requires an index`。
+若 `.vcf.gz` 报 "not a BGZF file"：`zcat t.vcf.gz | bgzip > t.bgz.vcf.gz && tabix -p vcf t.bgz.vcf.gz`。
+
+## 运行资源（各步）
+
+重活在 **01/02**（全基因组 pileup）；**03/04** 很轻。
+
+| 步骤 | CPU | 内存 | 说明 |
+|---|---|---|---|
+| 01 make_candidates | 多核受益；BAM I/O 密集 | 不高（流式） | 少扫 `--regions` 省时 |
+| 02 extract_features | CPU 重（逐候选重新 pileup） | 不高（流式） | 随候选数增长 |
+| 03 train_eval | 4–8 核足够（GBDT 自动吃满）；`--n-bag N` ≈ N× 时间 | **features.tsv 装进 pandas**：~2–5 GB / 每 ~1000 万行。chr1 训 + chr20 测 → 4–8 GB；全基因组（1000 万+ 行）→ 16 GB。OOM → 少用几条染色体 | — |
+| 04 apply_rescore | 1 核即可 | 小 | 出 FASTA 需 `bcftools` |

@@ -67,5 +67,28 @@ recalibrate on ERCC for the RNA/isoform application.
 
 ## Requires
 
-`pysam, pandas, numpy, scikit-learn, lightgbm` (see `environment.yml`).
-Truth VCF must be bgzip+tabix; reference needs `.fai`.
+`pysam, pandas, numpy, scikit-learn, lightgbm` (see `environment.yml`);
+`samtools, htslib, bcftools` (indexing + step 4 consensus).
+
+## Prerequisites — indexes (do this first)
+
+| Input | Needs | Make it |
+|---|---|---|
+| BAM | `.bai` | `samtools index reads.bam` |
+| reference FASTA | `.fai` | `samtools faidx ref.fa` |
+| truth VCF | bgzip **+** tabix `.tbi` | `bgzip -c t.vcf > t.vcf.gz && tabix -p vcf t.vcf.gz` |
+| confident BED | — (read into memory) | none |
+
+A plain `.vcf` or plain-gzip `.vcf.gz` triggers `fetch requires an index`. If a
+`.vcf.gz` errors as "not a BGZF file": `zcat t.vcf.gz | bgzip > t.bgz.vcf.gz && tabix -p vcf t.bgz.vcf.gz`.
+
+## Running resources (per step)
+
+The heavy steps are **01/02** (genome pileup); **03/04** are light.
+
+| Step | CPU | Memory | Notes |
+|---|---|---|---|
+| 01 make_candidates | benefits from more cores; I/O-bound on the BAM | modest (streams) | scan fewer `--regions` to cut time |
+| 02 extract_features | CPU-heavy (re-pileup per candidate) | modest (streams) | scales with #candidates |
+| 03 train_eval | 4–8 cores plenty (GBDT auto-uses all); `--n-bag N` ≈ N× time | **loads features.tsv into pandas**: ~2–5 GB per ~10M rows. chr1 train + chr20 test → 4–8 GB; genome-wide (10M+ rows) → 16 GB. OOM → train on fewer chroms | — |
+| 04 apply_rescore | 1 core fine | small | + `bcftools` for the FASTA |

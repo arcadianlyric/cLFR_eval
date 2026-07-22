@@ -19,6 +19,37 @@ Molecule id source:
   --molecule-source tag            -> read tag (default BX)
   --molecule-source readname_regex -> group(1) of a regex on the read name
   --molecule-source read           -> each read is its own molecule (ablation)
+
+Inputs
+------
+  --bam              same BAM as 01 (SE600, needs .bai). Reads are re-pileup'd at
+                     each candidate to extract molecule/per-read features.
+  --ref              reference FASTA (+ .fai) — for homopolymer_run context.
+  --candidates       TSV from 01_make_candidates.py (chrom/pos/ref/alt/label...).
+  --out              output feature TSV (fed to 03).
+  --molecule-source  tag | readname_regex | read (how to get the UMI/barcode).
+  --molecule-tag     (default BX) tag name when --molecule-source tag.
+  --readname-regex   (default `#([ACGTN]+)`) group(1)=barcode, for readname_regex.
+  --indel-window     (default 10) an alt read is "indel-adjacent" if it has an I/D
+                     within this many ref bp (N/intron excluded -> splice-aware).
+  --min-base-quality (default 0) SE600 keeps low-qual bases; leave 0.
+  --max-depth        (default 8000) pileup depth cap.
+
+Output TSV: chrom pos ref alt label + 25 feature columns (see FEATURES).
+
+Usage
+-----
+  # cLFR barcode in read name (SE600), homopolymer needs --ref
+  python 02_extract_features.py \
+    --bam HG002.se600.minimap2.bam --ref GRCh38.fa \
+    --candidates out/candidates.tsv --out out/features.tsv \
+    --molecule-source readname_regex --readname-regex '#([ACGTN]+)' \
+    --indel-window 10
+
+  # barcode/UMI stored in a BAM tag instead
+  python 02_extract_features.py --bam a.bam --ref ref.fa \
+    --candidates out/candidates.tsv --out out/features.tsv \
+    --molecule-source tag --molecule-tag BX
 """
 import argparse
 import re

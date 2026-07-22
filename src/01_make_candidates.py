@@ -31,7 +31,7 @@ Output TSV columns: chrom  pos  ref  alt  label  dp  alt_reads  vaf
 
 Usage
 -----
-  # train chrom (chr1) + held-out test chrom (chr20), HG002 SE600
+  # train chrom (chr1) + held-out test chrom (chr20), HG002 SE600, bam and vcf need index
   python 01_make_candidates.py \
     --bam   HG002.se600.minimap2.bam \
     --ref   GRCh38.fa \

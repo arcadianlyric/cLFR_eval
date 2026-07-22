@@ -14,6 +14,32 @@ the reference. This applies the trained Claim A model and decides per SNP:
 The corrected isoform FASTA is then produced from the KEEP set:
   bcftools sort out.pass.vcf -Oz -o out.pass.vcf.gz && tabix -p vcf out.pass.vcf.gz
   bcftools consensus -f <ref_or_transcriptome>.fa out.pass.vcf.gz > corrected_isoforms.fa
+
+Inputs
+------
+  --features     02_extract_features.py output, run on the CONSENSUS-supporting
+                 reads (candidates = positions where consensus != reference).
+  --model        model.txt from 03_train_eval.py (the trained lightgbm model;
+                 feature columns must match 03's `all` set).
+  --out-prefix   prefix for outputs:
+                   <prefix>.rescored.tsv  per-SNP p_true + decision
+                   <prefix>.pass.vcf      KEEP SNPs (for bcftools consensus)
+                   <prefix>.rna_edits.tsv EDIT-annotated RNA-editing sites
+  --threshold    (default 0.5) KEEP if p_true >= threshold, else REVERT.
+  --editing-bed  (optional) REDIportal-style BED of RNA-editing sites; A>G / T>C
+                 hits are labeled EDIT (kept & annotated, never reverted).
+
+Usage
+-----
+  # feature-extract on consensus reads first (02), then re-score
+  python 04_apply_rescore.py \
+    --features out/consensus_features.tsv \
+    --model    out/claimA_all/model.txt \
+    --out-prefix out/corrected --threshold 0.5 \
+    --editing-bed REDIportal.hg38.bed
+  # then: bcftools sort out/corrected.pass.vcf -Oz -o out/corrected.pass.vcf.gz
+  #       tabix -p vcf out/corrected.pass.vcf.gz
+  #       bcftools consensus -f REF.fa out/corrected.pass.vcf.gz > corrected_isoforms.fa
 """
 import argparse
 import sys

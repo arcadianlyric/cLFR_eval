@@ -17,6 +17,44 @@ Options:
 
 Ablation (money chart): run with --feature-set all vs baseline; the PR-AUC delta
 (largest among higher-VAF errors = mapping artifacts) is the molecule-feature value.
+
+Inputs
+------
+  --features        feature TSV from 02_extract_features.py.
+  --out-dir         output dir (metrics.json, feature_importance.csv,
+                    calibration.csv, strata_counts_*.csv, test_predictions.tsv, model.*).
+  --test-chroms     chrom(s) held out for test, e.g. `chr20` (rest = train).
+  --feature-set     all | baseline | no_molecule | molecule_only (UMI ablation:
+                    UMI value = PR-AUC(all) - PR-AUC(no_molecule)).
+  --model           lightgbm (default) | xgboost (robustness check).
+  --n-bag           (default 1) seed-bagged models; >1 also emits per-SNP uncertainty.
+  --calib-frac      (default 0.2) TRAIN fraction held out to fit calibration.
+  --threshold       (default 0.5) decision threshold for the confusion matrix.
+  --min-hard-count  (default 200) warn if a hard class (high-VAF error / low-VAF
+                    true) is thinner than this.
+  --seed            (default 42).
+
+Resources (this step is light; 01/02 pileup are the heavy CPU steps)
+  CPU:  4-8 cores is plenty. LightGBM/XGBoost auto-use all cores. --n-bag N runs N
+        trainings sequentially -> ~N x time (give more cores / time if bagging).
+  MEM:  dominated by loading features.tsv into pandas, NOT the model.
+        rule of thumb ~2-5 GB per ~10M candidate rows.
+        chr1 train + chr20 test (~100k-1M rows) -> 4-8 GB is safe.
+        genome-wide (10M+ rows) -> 16 GB comfortable. If OOM, train on fewer chroms.
+
+Usage
+-----
+  # money chart: 3-stage ablation isolating the UMI contribution
+  for FS in baseline no_molecule all; do
+    python 03_train_eval.py --features out/features.tsv \
+      --out-dir out/claimA_$FS --test-chroms chr20 --feature-set $FS
+  done   # UMI value = PR-AUC(claimA_all) - PR-AUC(claimA_no_molecule)
+
+  # uncertainty (seed-bagging) + xgboost robustness check
+  python 03_train_eval.py --features out/features.tsv --out-dir out/bag \
+    --test-chroms chr20 --n-bag 10
+  python 03_train_eval.py --features out/features.tsv --out-dir out/xgb \
+    --test-chroms chr20 --model xgboost
 """
 import argparse
 import json
