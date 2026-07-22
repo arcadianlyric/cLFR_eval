@@ -32,11 +32,13 @@ Inputs
   --threshold       (default 0.5) decision threshold for the confusion matrix.
   --min-hard-count  (default 200) warn if a hard class (high-VAF error / low-VAF
                     true) is thinner than this.
+  --threads         (default 8) cap CPU threads for GBDT + OMP/BLAS. -1 = all cores.
   --seed            (default 42).
 
 Resources (this step is light; 01/02 pileup are the heavy CPU steps)
-  CPU:  4-8 cores is plenty. LightGBM/XGBoost auto-use all cores. --n-bag N runs N
-        trainings sequentially -> ~N x time (give more cores / time if bagging).
+  CPU:  GBDT grabs ALL cores by default -> on a big shared server (e.g. 128-core)
+        cap with --threads N (default 8; also caps OMP/BLAS). --n-bag N runs N
+        trainings sequentially -> ~N x time.
   MEM:  dominated by loading features.tsv into pandas, NOT the model.
         rule of thumb ~2-5 GB per ~10M candidate rows.
         chr1 train + chr20 test (~100k-1M rows) -> 4-8 GB is safe.
@@ -117,18 +119,19 @@ def stratify_counts(frame):
     return pd.DataFrame(rows)
 
 
-def build_model(kind, seed, scale_pos_weight):
+def build_model(kind, seed, scale_pos_weight, n_jobs):
     if kind == "lightgbm":
         from lightgbm import LGBMClassifier
         return LGBMClassifier(n_estimators=400, learning_rate=0.05, num_leaves=31,
                               subsample=0.8, colsample_bytree=0.8, verbose=-1,
+                              n_jobs=n_jobs,
                               scale_pos_weight=scale_pos_weight, random_state=seed)
     if kind == "xgboost":
         from xgboost import XGBClassifier
         return XGBClassifier(n_estimators=400, learning_rate=0.05, max_depth=6,
                              subsample=0.8, colsample_bytree=0.8, tree_method="hist",
-                             eval_metric="logloss", scale_pos_weight=scale_pos_weight,
-                             random_state=seed)
+                             eval_metric="logloss", n_jobs=n_jobs,
+                             scale_pos_weight=scale_pos_weight, random_state=seed)
     raise ValueError(kind)
 
 
@@ -165,8 +168,17 @@ def main():
     ap.add_argument("--threshold", type=float, default=0.5)
     ap.add_argument("--min-hard-count", type=int, default=200,
                     help="warn if a hard class (high-VAF error / low-VAF true) is thinner than this")
+    ap.add_argument("--threads", type=int, default=8,
+                    help="max CPU threads for LightGBM/XGBoost (default 8; prevents "
+                         "grabbing all cores on a big shared server). -1 = all.")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
+
+    # cap BLAS/OpenMP threads (pandas/numpy/sklearn) too, before heavy work
+    if args.threads and args.threads > 0:
+        for v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                  "NUMEXPR_NUM_THREADS"):
+            os.environ.setdefault(v, str(args.threads))
 
     os.makedirs(args.out_dir, exist_ok=True)
     feats = feature_set(args.feature_set)
@@ -207,7 +219,7 @@ def main():
             frac=1.0, replace=True, random_state=args.seed + b)
         y = sample["label"].values
         n_pos, n_neg = max(1, int(y.sum())), max(1, int((y == 0).sum()))
-        m = build_model(args.model, args.seed + b, n_neg / n_pos)
+        m = build_model(args.model, args.seed + b, n_neg / n_pos, args.threads)
         m.fit(sample[feats], y)
         models.append(m)
 

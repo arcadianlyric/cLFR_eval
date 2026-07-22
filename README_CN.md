@@ -133,5 +133,5 @@ bcftools consensus -f REF.fa out/corrected.pass.vcf.gz > corrected_isoforms.fa
 |---|---|---|---|
 | 01 make_candidates | 多核受益；BAM I/O 密集 | 不高（流式） | 少扫 `--regions` 省时 |
 | 02 extract_features | CPU 重（逐候选重新 pileup） | 不高（流式） | 随候选数增长 |
-| 03 train_eval | 4–8 核足够（GBDT 自动吃满）；`--n-bag N` ≈ N× 时间 | **features.tsv 装进 pandas**：~2–5 GB / 每 ~1000 万行。chr1 训 + chr20 测 → 4–8 GB；全基因组（1000 万+ 行）→ 16 GB。OOM → 少用几条染色体 | — |
+| 03 train_eval | GBDT 默认抓满所有核 → **用 `--threads N` 封顶**（默认 8；同时封 OMP/BLAS）；`--n-bag N` ≈ N× 时间 | **features.tsv 装进 pandas**：~2–5 GB / 每 ~1000 万行。chr1 训 + chr20 测 → 4–8 GB；全基因组（1000 万+ 行）→ 16 GB。OOM → 少用几条染色体 | 128 核共享机上 `--threads 8` 才礼貌 |
 | 04 apply_rescore | 1 核即可 | 小 | 出 FASTA 需 `bcftools` |

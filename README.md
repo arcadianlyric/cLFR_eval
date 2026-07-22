@@ -90,5 +90,5 @@ The heavy steps are **01/02** (genome pileup); **03/04** are light.
 |---|---|---|---|
 | 01 make_candidates | benefits from more cores; I/O-bound on the BAM | modest (streams) | scan fewer `--regions` to cut time |
 | 02 extract_features | CPU-heavy (re-pileup per candidate) | modest (streams) | scales with #candidates |
-| 03 train_eval | 4–8 cores plenty (GBDT auto-uses all); `--n-bag N` ≈ N× time | **loads features.tsv into pandas**: ~2–5 GB per ~10M rows. chr1 train + chr20 test → 4–8 GB; genome-wide (10M+ rows) → 16 GB. OOM → train on fewer chroms | — |
+| 03 train_eval | GBDT grabs ALL cores by default → **cap with `--threads N`** (default 8; also caps OMP/BLAS). `--n-bag N` ≈ N× time | **loads features.tsv into pandas**: ~2–5 GB per ~10M rows. chr1 train + chr20 test → 4–8 GB; genome-wide (10M+ rows) → 16 GB. OOM → train on fewer chroms | on a 128-core shared box `--threads 8` keeps it polite |
 | 04 apply_rescore | 1 core fine | small | + `bcftools` for the FASTA |
