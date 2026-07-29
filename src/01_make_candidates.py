@@ -108,12 +108,13 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--min-alt-reads", type=int, default=2,
                     help="min alt reads to accept an error-class candidate")
+    ap.add_argument("--threads", type=int, default=4, help="BAM decompression threads")
     ap.add_argument("--min-base-quality", type=int, default=0)
     ap.add_argument("--max-depth", type=int, default=8000)
     args = ap.parse_args()
 
     starts, ends = load_confident(args.confident_bed)
-    bam = pysam.AlignmentFile(args.bam, "rb")
+    bam = pysam.AlignmentFile(args.bam, "rb", threads=max(1, args.threads))
     fasta = pysam.FastaFile(args.ref)
 
     n_true = n_err = 0
@@ -121,49 +122,56 @@ def main():
         out.write("chrom\tpos\tref\talt\tlabel\tdp\talt_reads\tvaf\n")
         for region in args.regions:
             chrom, rstart, rend = parse_region(region, fasta)
+            if chrom not in starts:
+                continue
             snv, any_var = load_truth(args.truth_vcf, chrom, rstart, rend)
 
-            for col in bam.pileup(chrom, rstart, rend, truncate=True,
-                                  min_base_quality=args.min_base_quality,
-                                  stepper="samtools", max_depth=args.max_depth):
-                pos0 = col.reference_pos
-                if not in_confident(chrom, pos0, starts, ends):
+            # pileup ONLY inside confident intervals (skip non-confident spans);
+            # prefetch the interval reference once instead of one fetch per column.
+            for s0, e0 in zip(starts[chrom], ends[chrom]):
+                s, e = max(int(s0), rstart), min(int(e0), rend)
+                if s >= e:
                     continue
-                refbase = fasta.fetch(chrom, pos0, pos0 + 1).upper()
-                if refbase not in "ACGT":
-                    continue
-
-                counts = {}
-                for pr in col.pileups:
-                    if pr.is_del or pr.is_refskip or pr.query_position is None:
+                refseq = fasta.fetch(chrom, s, e).upper()
+                for col in bam.pileup(chrom, s, e, truncate=True,
+                                      min_base_quality=args.min_base_quality,
+                                      stepper="samtools", max_depth=args.max_depth):
+                    pos0 = col.reference_pos
+                    refbase = refseq[pos0 - s]
+                    if refbase not in "ACGT":
                         continue
-                    b = pr.alignment.query_sequence[pr.query_position].upper()
-                    counts[b] = counts.get(b, 0) + 1
-                dp = sum(counts.values())
-                if dp == 0:
-                    continue
 
-                if pos0 in snv:
-                    ref, alt = snv[pos0]
-                    alt_reads = counts.get(alt, 0)
-                    if alt_reads < 1:
-                        continue  # no observed alt -> nothing to featurize
-                    label = 1
-                    n_true += 1
-                else:
-                    if pos0 in any_var:
-                        continue  # GIAB indel/other -> ambiguous
-                    alt, alt_reads = None, 0
-                    for b, c in counts.items():
-                        if b != refbase and b in "ACGT" and c > alt_reads:
-                            alt, alt_reads = b, c
-                    if alt is None or alt_reads < args.min_alt_reads:
+                    counts = {}
+                    for pr in col.pileups:
+                        if pr.is_del or pr.is_refskip or pr.query_position is None:
+                            continue
+                        b = pr.alignment.query_sequence[pr.query_position].upper()
+                        counts[b] = counts.get(b, 0) + 1
+                    dp = sum(counts.values())
+                    if dp == 0:
                         continue
-                    ref, label = refbase, 0
-                    n_err += 1
 
-                out.write(f"{chrom}\t{pos0 + 1}\t{ref}\t{alt}\t{label}\t"
-                          f"{dp}\t{alt_reads}\t{alt_reads / dp:.4f}\n")
+                    if pos0 in snv:
+                        ref, alt = snv[pos0]
+                        alt_reads = counts.get(alt, 0)
+                        if alt_reads < 1:
+                            continue  # no observed alt -> nothing to featurize
+                        label = 1
+                        n_true += 1
+                    else:
+                        if pos0 in any_var:
+                            continue  # GIAB indel/other -> ambiguous
+                        alt, alt_reads = None, 0
+                        for b, c in counts.items():
+                            if b != refbase and b in "ACGT" and c > alt_reads:
+                                alt, alt_reads = b, c
+                        if alt is None or alt_reads < args.min_alt_reads:
+                            continue
+                        ref, label = refbase, 0
+                        n_err += 1
+
+                    out.write(f"{chrom}\t{pos0 + 1}\t{ref}\t{alt}\t{label}\t"
+                              f"{dp}\t{alt_reads}\t{alt_reads / dp:.4f}\n")
 
     sys.stderr.write(f"[make_candidates] true={n_true} error={n_err} -> {args.out}\n")
 
