@@ -150,11 +150,86 @@ def save_model(model, kind, out_dir):
         model.get_booster().save_model(f"{out_dir}/model.json")
 
 
+def run_cv(df, feats, args):
+    """K-fold CV for single-chromosome data. GroupKFold by --cv-block bp so
+    neighbouring (correlated) sites stay in the same fold -> no position leakage.
+    Reports per-fold + mean/std ROC-AUC, PR-AUC, Brier."""
+    from sklearn.model_selection import GroupKFold
+    from sklearn.isotonic import IsotonicRegression
+    os.makedirs(args.out_dir, exist_ok=True)
+    X, y = df[feats].reset_index(drop=True), df["label"].values
+    groups = (df["pos"] // args.cv_block).values
+    n_groups = len(set(groups))
+    k = min(args.cv, n_groups)
+    if k < 2:
+        sys.exit(f"ERROR: only {n_groups} position blocks; need >=2 for CV.")
+    sys.stderr.write(f"[cv] {k}-fold GroupKFold, {n_groups} blocks of {args.cv_block}bp, "
+                     f"n={len(df)}, pos={int(y.sum())}, neg={int((y==0).sum())}\n")
+
+    gkf = GroupKFold(n_splits=k)
+    folds, gains = [], {f: 0.0 for f in feats}
+    for i, (tr, te) in enumerate(gkf.split(X, y, groups)):
+        ytr = y[tr]
+        spw = max(1, int((ytr == 0).sum())) / max(1, int(ytr.sum()))
+        rng = np.random.default_rng(args.seed + i)
+        cal = rng.random(len(tr)) < args.calib_frac
+        fit_i, cal_i = tr[~cal], tr[cal]
+        model = build_model(args.model, args.seed + i, spw, args.threads)
+        model.fit(X.iloc[fit_i], y[fit_i])
+        calib = None
+        if len(cal_i) > 50 and len(set(y[cal_i])) == 2:
+            pc = model.predict_proba(X.iloc[cal_i])[:, 1]
+            calib = IsotonicRegression(out_of_bounds="clip").fit(pc, y[cal_i])
+        praw = model.predict_proba(X.iloc[te])[:, 1]
+        pt = calib.predict(praw) if calib is not None else praw
+        yte = y[te]
+        two = len(set(yte)) == 2
+        folds.append({
+            "fold": i, "n_test": int(len(te)),
+            "test_pos": int(yte.sum()), "test_neg": int((yte == 0).sum()),
+            "roc_auc": float(roc_auc_score(yte, pt)) if two else None,
+            "pr_auc": float(average_precision_score(yte, pt)) if two else None,
+            "brier": float(brier_score_loss(yte, pt)) if two else None,
+        })
+        for f, g in feature_gain(model, args.model, feats).items():
+            gains[f] += g / k
+        sys.stderr.write(f"[cv] fold {i}: pr_auc={folds[-1]['pr_auc']} "
+                         f"roc_auc={folds[-1]['roc_auc']} test_pos={folds[-1]['test_pos']}\n")
+
+    def agg(key):
+        v = [m[key] for m in folds if m[key] is not None]
+        return {"mean": float(np.mean(v)), "std": float(np.std(v))} if v else None
+
+    summary = {
+        "mode": "cv", "cv": k, "cv_block": args.cv_block, "n_groups": n_groups,
+        "feature_set": args.feature_set, "n_features": len(feats), "model": args.model,
+        "n_total": int(len(df)), "total_pos": int(y.sum()), "total_neg": int((y == 0).sum()),
+        "roc_auc": agg("roc_auc"), "pr_auc": agg("pr_auc"), "brier": agg("brier"),
+        "folds": folds,
+    }
+    pd.DataFrame([{"feature": f, "gain": gains[f]} for f in feats]
+                 ).sort_values("gain", ascending=False).to_csv(
+        f"{args.out_dir}/feature_importance.csv", index=False)
+    with open(f"{args.out_dir}/cv_metrics.json", "w") as fh:
+        json.dump(summary, fh, indent=2)
+    print(json.dumps({"cv": k, "roc_auc": summary["roc_auc"],
+                      "pr_auc": summary["pr_auc"], "brier": summary["brier"],
+                      "n_groups": n_groups}, indent=2))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--features", required=True)
     ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--test-chroms", nargs="+", required=True)
+    ap.add_argument("--test-chroms", nargs="+", default=None,
+                    help="chrom(s) held out for test (chrom-holdout mode). "
+                         "Omit when using --cv.")
+    ap.add_argument("--cv", type=int, default=0,
+                    help="if >1, k-fold cross-validation instead of chrom-holdout. "
+                         "Use for single-chromosome data (e.g. only chr22).")
+    ap.add_argument("--cv-block", type=int, default=1_000_000,
+                    help="GroupKFold block size in bp: sites within a block stay in "
+                         "the same fold (prevents position leakage). default 1Mb.")
     ap.add_argument("--feature-set",
                     choices=["all", "baseline", "no_molecule", "molecule_only"],
                     default="all",
@@ -185,6 +260,13 @@ def main():
 
     df = pd.read_csv(args.features, sep="\t")
     df["label"] = df["label"].astype(int)
+
+    if args.cv and args.cv > 1:
+        run_cv(df, feats, args)
+        return
+    if not args.test_chroms:
+        sys.exit("ERROR: pass --test-chroms (chrom-holdout) or --cv K (cross-val).")
+
     test_df = df[df["chrom"].isin(args.test_chroms)].copy()
     train_df = df[~df["chrom"].isin(args.test_chroms)].copy()
     if len(train_df) == 0 or len(test_df) == 0:
